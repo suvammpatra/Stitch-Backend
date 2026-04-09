@@ -1,20 +1,25 @@
 """
 LangGraph Graph — Google Stitch Agent
 Nodes:
-  - preprocess     : inject system prompt + history
-  - agent          : Groq function-calling loop
+  - agent          : Groq function-calling loop (system prompt injected here)
   - tool_executor  : calls MCP tools with OAuth tokens
   - error_handler  : surfaces friendly errors
-  - finalizer      : post-processes output for Telegram
+  - finalizer      : extracts final reply text
 
 State: StitchState (TypedDict)
 Model: llama-3.3-70b-versatile via Groq (supports tool_use)
+
+Fixes vs v1:
+  - Removed separate preprocess node (caused empty-dict state update crash)
+  - System prompt injected directly inside agent node before LLM call
+  - _finalizer_node never returns {} — always writes final_reply
+  - _tool_executor_node never returns {} — always writes tool_calls_log
+  - retry_count incremented properly on each agent loop
 """
 
-import asyncio
 import json
 import logging
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Literal, TypedDict
 
 from langchain_core.messages import (
     AIMessage,
@@ -43,8 +48,8 @@ Rules:
 - Never hallucinate project IDs or screen names — always retrieve them first.
 - If the user's intent is ambiguous, ask ONE clarifying question.
 
-Available actions you can take:
-1. list_projects — list all Stitch projects for the user
+Available actions:
+1. list_projects — list all Stitch projects
 2. create_project — create a new Stitch project
 3. generate_screen_from_text — generate a UI screen from a text description
 4. get_screen — retrieve details about a specific screen
@@ -58,7 +63,7 @@ Available actions you can take:
 class StitchState(TypedDict):
     session_id: str
     messages: Annotated[list[BaseMessage], add_messages]
-    tool_calls_log: list[dict]       # For observability
+    tool_calls_log: list[dict]
     last_tool_error: str | None
     retry_count: int
     final_reply: str | None
@@ -72,8 +77,6 @@ class StitchGraph:
 
     def __init__(self, oauth_manager: OAuthManager):
         self.oauth = oauth_manager
-        # llama-3.3-70b-versatile: best Groq model with reliable tool_use support
-        # llama-3.1-8b-instant: faster/cheaper fallback
         self.llm = ChatGroq(
             model="llama-3.3-70b-versatile",
             temperature=0,
@@ -85,14 +88,13 @@ class StitchGraph:
     def _build(self):
         builder = StateGraph(StitchState)
 
-        builder.add_node("preprocess", self._preprocess_node)
+        # No separate preprocess node — agent handles everything
         builder.add_node("agent", self._agent_node)
         builder.add_node("tool_executor", self._tool_executor_node)
         builder.add_node("error_handler", self._error_handler_node)
         builder.add_node("finalizer", self._finalizer_node)
 
-        builder.add_edge(START, "preprocess")
-        builder.add_edge("preprocess", "agent")
+        builder.add_edge(START, "agent")
         builder.add_conditional_edges(
             "agent",
             self._route_after_agent,
@@ -117,70 +119,91 @@ class StitchGraph:
 
     # ── Nodes ─────────────────────────────────────────────────────────────
 
-    async def _preprocess_node(self, state: StitchState) -> dict:
-        """Inject system prompt + historical messages."""
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-        return {"messages": messages}
-
     async def _agent_node(self, state: StitchState) -> dict:
-        """Run the LLM with tools bound. Respects iteration cap."""
+        """Run Groq LLM with tools. Injects system prompt on first iteration."""
         session_id = state["session_id"]
         iteration = state.get("retry_count", 0)
 
         if iteration >= self.MAX_AGENT_ITERATIONS:
-            logger.warning(f"[agent] Max iterations hit for session {session_id}")
+            logger.warning(f"[agent] Max iterations hit for session={session_id}")
             return {
-                "last_tool_error": "Max reasoning steps reached. Please rephrase your request.",
-                "retry_count": iteration,
+                "last_tool_error": "Max reasoning steps reached. Please rephrase.",
+                "retry_count": iteration + 1,
+                "final_reply": None,
             }
 
-        # Build tool definitions dynamically (with OAuth token for user)
+        # Get valid OAuth token (falls back to static token)
         try:
             token = await self.oauth.get_valid_token(session_id)
         except TokenExpiredError:
             return {
-                "last_tool_error": "Authentication expired. Please re-authorize Google Stitch.",
+                "last_tool_error": "Google Stitch authentication expired. Please re-authorize.",
+                "retry_count": iteration + 1,
+                "final_reply": None,
             }
 
+        # Build tool list
         mcp = StitchMCPClient(access_token=token)
         tools = mcp.get_langchain_tools()
         llm_with_tools = self.llm.bind_tools(tools)
 
+        # Prepend system prompt only on first iteration (avoid duplication)
+        messages = state["messages"]
+        if iteration == 0:
+            # Check if system prompt already present
+            has_system = any(isinstance(m, SystemMessage) for m in messages)
+            if not has_system:
+                messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
+
         try:
-            response = await llm_with_tools.ainvoke(state["messages"])
+            response = await llm_with_tools.ainvoke(messages)
+            logger.info(f"[agent] iter={iteration} session={session_id} tool_calls={len(getattr(response, 'tool_calls', []))}")
             return {
                 "messages": [response],
-                "retry_count": iteration,
+                "retry_count": iteration + 1,
+                "last_tool_error": None,
             }
         except Exception as e:
             logger.exception(f"[agent] LLM call failed: {e}")
             return {
                 "last_tool_error": f"LLM error: {str(e)}",
+                "retry_count": iteration + 1,
+                "final_reply": None,
             }
 
     async def _tool_executor_node(self, state: StitchState) -> dict:
         """Execute all tool calls from the latest AI message."""
         session_id = state["session_id"]
         last_message = state["messages"][-1]
+        tool_log = list(state.get("tool_calls_log", []))
 
-        if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
-            return {}
+        # Guard: no tool calls present
+        if not getattr(last_message, "tool_calls", None):
+            logger.warning(f"[tools] tool_executor called but no tool_calls found")
+            return {
+                "tool_calls_log": tool_log,
+                "last_tool_error": None,
+                "messages": [],
+            }
 
         try:
             token = await self.oauth.get_valid_token(session_id)
         except TokenExpiredError as e:
-            return {"last_tool_error": str(e)}
+            return {
+                "last_tool_error": str(e),
+                "tool_calls_log": tool_log,
+                "messages": [],
+            }
 
         mcp = StitchMCPClient(access_token=token)
-        tool_results = []
-        tool_log = list(state.get("tool_calls_log", []))
+        tool_messages = []
 
         for tc in last_message.tool_calls:
             tool_name = tc["name"]
             tool_args = tc["args"]
             tool_id = tc["id"]
 
-            logger.info(f"[tools] Calling {tool_name} args={tool_args} session={session_id}")
+            logger.info(f"[tools] calling={tool_name} session={session_id}")
 
             result, error = await mcp.call_tool(
                 tool_name=tool_name,
@@ -195,45 +218,48 @@ class StitchGraph:
                 "error": error,
             })
 
-            content = json.dumps(result) if error is None else f"ERROR: {error}"
-            tool_results.append(
-                ToolMessage(content=content, tool_call_id=tool_id)
-            )
+            content = json.dumps(result) if result is not None else f"ERROR: {error}"
+            tool_messages.append(ToolMessage(content=content, tool_call_id=tool_id))
 
             if error:
                 logger.warning(f"[tools] {tool_name} failed: {error}")
 
         return {
-            "messages": tool_results,
+            "messages": tool_messages,
             "tool_calls_log": tool_log,
             "last_tool_error": None,
         }
 
     async def _error_handler_node(self, state: StitchState) -> dict:
-        error = state.get("last_tool_error", "An unknown error occurred.")
-        logger.error(f"[error_handler] session={state['session_id']} error={error}")
+        error = state.get("last_tool_error") or "An unknown error occurred."
+        logger.error(f"[error] session={state['session_id']} error={error}")
         return {
-            "final_reply": f"❌ *Error:* {error}\n\nPlease try again or contact support.",
+            "final_reply": f"❌ *Error:* {error}\n\nPlease try again.",
+            "last_tool_error": error,
         }
 
     async def _finalizer_node(self, state: StitchState) -> dict:
-        """Extract the last AI text response as the reply."""
+        """Always writes final_reply — never returns empty dict."""
+        # Error handler already set it
         if state.get("final_reply"):
-            return {}  # Already set by error handler
+            return {"final_reply": state["final_reply"]}
 
-        # Walk messages in reverse to find last non-tool AIMessage
+        # Find last non-empty AIMessage text
         for msg in reversed(state["messages"]):
-            if isinstance(msg, AIMessage) and isinstance(msg.content, str) and msg.content.strip():
+            if (
+                isinstance(msg, AIMessage)
+                and isinstance(msg.content, str)
+                and msg.content.strip()
+            ):
                 return {"final_reply": msg.content}
 
-        return {"final_reply": "✅ Done. No output was returned by the tool."}
+        return {"final_reply": "✅ Done. No text output was returned by the tool."}
 
     # ── Routers ───────────────────────────────────────────────────────────
 
     def _route_after_agent(self, state: StitchState) -> Literal["tools", "done", "error"]:
         if state.get("last_tool_error"):
             return "error"
-
         last = state["messages"][-1]
         if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
             return "tools"
@@ -244,15 +270,17 @@ class StitchGraph:
             return "error"
         return "agent"
 
-    # ── Public run() ──────────────────────────────────────────────────────
+    # ── Public entrypoint ─────────────────────────────────────────────────
 
     async def run(self, session_id: str, message: str, history: list[dict]) -> dict:
         """
-        Entrypoint called by FastAPI.
+        Called by FastAPI /invoke.
         history = [{"role": "user"|"assistant", "content": "..."}]
         """
         messages: list[BaseMessage] = []
-        for turn in history[-10:]:  # Limit context window
+
+        # Load last 10 turns of history (20 messages)
+        for turn in history[-20:]:
             if turn["role"] == "user":
                 messages.append(HumanMessage(content=turn["content"]))
             else:
@@ -269,9 +297,18 @@ class StitchGraph:
             "final_reply": None,
         }
 
-        final_state = await self.graph.ainvoke(initial_state)
+        logger.info(f"[run] session={session_id} message={message[:60]!r}")
+
+        try:
+            final_state = await self.graph.ainvoke(initial_state)
+        except Exception as e:
+            logger.exception(f"[run] graph.ainvoke crashed: {e}")
+            return {
+                "reply": f"❌ Internal error: {str(e)}",
+                "tool_calls": [],
+            }
 
         return {
-            "reply": final_state.get("final_reply", ""),
+            "reply": final_state.get("final_reply") or "No reply generated.",
             "tool_calls": final_state.get("tool_calls_log", []),
         }
