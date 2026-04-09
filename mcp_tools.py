@@ -66,10 +66,20 @@ class AuthRequired(Exception):
 class StitchMCPClient:
     def __init__(self, access_token: str):
         self.access_token = access_token
-        self._headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        }
+        # Auto-detect token type:
+        # - OAuth tokens start with "ya29." → Authorization: Bearer
+        # - API keys start with "AIza"      → X-Goog-Api-Key header
+        # - Anything else                    → try Bearer first
+        if access_token.startswith("AIza"):
+            self._headers = {
+                "X-Goog-Api-Key": access_token,
+                "Content-Type": "application/json",
+            }
+        else:
+            self._headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            }
 
     async def call_tool(
         self,
