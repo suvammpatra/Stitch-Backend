@@ -38,10 +38,8 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 # Scopes required by Google Stitch MCP
-STITCH_SCOPES = " ".join([
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/stitch",
-])
+# Note: auth/stitch does not exist — cloud-platform covers all Google APIs
+STITCH_SCOPES = "https://www.googleapis.com/auth/cloud-platform"
 
 
 @asynccontextmanager
